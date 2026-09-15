@@ -454,6 +454,14 @@ impl Context {
         }
     }
 
+    /// Register this worker's waker slot with its shutdown handle, so that starting a
+    /// shutdown wakes the worker even when it is parked on an idle backend.
+    pub(crate) fn register_shutdown_waker(&self) {
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.register_waker(&self.waker);
+        }
+    }
+
     /// Calling this function triggers shutting down the worker while waiting for any tasks to complete
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);

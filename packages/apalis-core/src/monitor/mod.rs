@@ -57,6 +57,7 @@ impl Monitor {
         worker.state.event_handler = self.event_handler.clone();
         let runnable = worker.run();
         let handle = runnable.get_handle();
+        handle.state.register_shutdown_waker();
         self.workers.push(handle);
         self.futures.push(runnable.boxed());
         self
@@ -266,6 +267,45 @@ mod tests {
         });
         monitor.run().await.unwrap();
     }
+    /// Regression: a monitor with more than 30 idle workers must still shut down.
+    ///
+    /// `futures::future::join_all` polls every future it holds on each wake-up only while
+    /// there are 30 or fewer of them; above that it switches to `FuturesOrdered`, which
+    /// polls just the futures whose own waker was woken. Starting a shutdown only flips a
+    /// shared flag, so unless every worker is woken explicitly the idle ones are never
+    /// re-polled and never observe it.
+    #[tokio::test]
+    async fn shutdown_wakes_idle_workers_above_join_all_threshold() {
+        const WORKERS: usize = 31;
+
+        let mut monitor: Monitor = Monitor::new();
+        for index in 0..WORKERS {
+            // An empty `MemoryStorage` never yields a task, so the worker parks exactly
+            // like a cron worker waiting for a distant tick.
+            let service = tower::service_fn(|request: Request<u32, ()>| async move {
+                Ok::<_, io::Error>(request)
+            });
+            let worker = WorkerBuilder::new(format!("idle-{index}"))
+                .backend(MemoryStorage::new())
+                .build(service);
+            monitor = monitor.register(worker);
+        }
+
+        let shutdown = monitor.shutdown.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            shutdown.start_shutdown();
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(5), monitor.run()).await;
+
+        let exit = match result {
+            Ok(exit) => exit,
+            Err(_) => panic!("monitor did not shut down {WORKERS} idle workers"),
+        };
+        exit.unwrap();
+    }
+
     #[tokio::test]
     async fn test_monitor_run() {
         let backend = MemoryStorage::new();
