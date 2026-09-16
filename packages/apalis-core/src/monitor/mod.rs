@@ -3,7 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use futures::{future::BoxFuture, Future, FutureExt};
+use futures::{
+    future::{join_all, pending, select, BoxFuture, Either},
+    Future, FutureExt,
+};
 use tower::{Layer, Service};
 
 /// Shutdown utilities
@@ -57,7 +60,6 @@ impl Monitor {
         worker.state.event_handler = self.event_handler.clone();
         let runnable = worker.run();
         let handle = runnable.get_handle();
-        handle.state.register_shutdown_waker();
         self.workers.push(handle);
         self.futures.push(runnable.boxed());
         self
@@ -127,9 +129,7 @@ impl Monitor {
         let shutdown_after = self.shutdown.shutdown_after(signal);
         if let Some(terminator) = self.terminator {
             let _res = futures::future::select(
-                futures::future::join_all(self.futures)
-                    .map(|_| shutdown.start_shutdown())
-                    .boxed(),
+                Self::run_all_workers(self.futures, self.workers, shutdown).boxed(),
                 async {
                     let _res = shutdown_after.await;
                     terminator.await;
@@ -157,11 +157,32 @@ impl Monitor {
         let shutdown = self.shutdown.clone();
         let shutdown_future = self.shutdown.boxed().map(|_| ());
         futures::join!(
-            futures::future::join_all(self.futures).map(|_| shutdown.start_shutdown()),
+            Self::run_all_workers(self.futures, self.workers, shutdown),
             shutdown_future,
         );
 
         Ok(())
+    }
+
+    /// Runs every worker to completion, then starts the shutdown.
+    async fn run_all_workers(
+        futures: Vec<BoxFuture<'static, ()>>,
+        workers: Vec<Worker<Context>>,
+        shutdown: Shutdown,
+    ) {
+        // Setting the shutdown flag does not wake idle workers, and above 30 futures
+        // `join_all` only re-polls the ones whose waker fired, so wake them all explicitly.
+        let wake_on_shutdown = shutdown.clone().then(move |()| {
+            for worker in &workers {
+                worker.state.wake();
+            }
+            pending::<()>()
+        });
+        match select(join_all(futures), wake_on_shutdown.boxed()).await {
+            Either::Left(_) => {}
+            Either::Right(((), _)) => unreachable!("pending never resolves"),
+        }
+        shutdown.start_shutdown();
     }
 
     /// Handles events emitted
@@ -304,6 +325,71 @@ mod tests {
             Err(_) => panic!("monitor did not shut down {WORKERS} idle workers"),
         };
         exit.unwrap();
+    }
+
+    /// Shutting down many idle workers must not cut short the one worker that is busy.
+    ///
+    /// Uses a terminator, so it also covers the `run_with_signal` branch that does not go
+    /// through `Monitor::run`. The terminator deadline is far above the expected exit time,
+    /// so the monitor only returns early if every worker actually drained and stopped.
+    #[tokio::test]
+    async fn signal_shutdown_drains_active_work_with_many_idle_workers() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        use std::time::Instant;
+
+        const IDLE_WORKERS: usize = 40;
+
+        let mut busy_backend = MemoryStorage::new();
+        busy_backend.enqueue(1u32).await.unwrap();
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = completed.clone();
+        let service = tower::service_fn(move |request: Request<u32, ()>| {
+            let flag = flag.clone();
+            async move {
+                sleep(Duration::from_millis(300)).await;
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, io::Error>(request)
+            }
+        });
+        let mut monitor: Monitor = Monitor::new()
+            .register(
+                WorkerBuilder::new("busy")
+                    .backend(busy_backend)
+                    .build(service),
+            )
+            .shutdown_timeout(Duration::from_secs(5));
+
+        for index in 0..IDLE_WORKERS {
+            let service = tower::service_fn(|request: Request<u32, ()>| async move {
+                Ok::<_, io::Error>(request)
+            });
+            let worker = WorkerBuilder::new(format!("idle-{index}"))
+                .backend(MemoryStorage::new())
+                .build(service);
+            monitor = monitor.register(worker);
+        }
+
+        let signal = async {
+            sleep(Duration::from_millis(50)).await;
+            Ok(())
+        };
+
+        let start = Instant::now();
+        monitor.run_with_signal(signal).await.unwrap();
+
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "monitor waited for the terminator instead of draining: {:?}",
+            start.elapsed()
+        );
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "shutdown cut short the in-flight task"
+        );
     }
 
     #[tokio::test]
