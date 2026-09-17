@@ -3,10 +3,7 @@ use std::{
     sync::Arc,
 };
 
-use futures::{
-    future::{join_all, pending, select, BoxFuture, Either},
-    Future, FutureExt,
-};
+use futures::{future::BoxFuture, stream::FuturesUnordered, Future, FutureExt, StreamExt};
 use tower::{Layer, Service};
 
 /// Shutdown utilities
@@ -121,15 +118,21 @@ impl Monitor {
     /// If a timeout has been set using the `Monitor::shutdown_timeout` method, the monitor
     /// will wait for all workers to complete up to the timeout duration before exiting.
     /// If the timeout is reached and workers have not completed, the monitor will exit forcefully.
-    pub async fn run_with_signal<S>(self, signal: S) -> std::io::Result<()>
+    pub async fn run_with_signal<S>(mut self, signal: S) -> std::io::Result<()>
     where
         S: Send + Future<Output = std::io::Result<()>>,
     {
         let shutdown = self.shutdown.clone();
-        let shutdown_after = self.shutdown.shutdown_after(signal);
+        let workers = std::mem::take(&mut self.workers);
+        let shutdown_after = async move {
+            let res = signal.await;
+            Self::shutdown_workers(&shutdown, &workers);
+            res
+        };
+        let shutdown = self.shutdown.clone();
         if let Some(terminator) = self.terminator {
             let _res = futures::future::select(
-                Self::run_all_workers(self.futures, self.workers, shutdown).boxed(),
+                Self::run_all_workers(self.futures, shutdown).boxed(),
                 async {
                     let _res = shutdown_after.await;
                     terminator.await;
@@ -157,7 +160,7 @@ impl Monitor {
         let shutdown = self.shutdown.clone();
         let shutdown_future = self.shutdown.boxed().map(|_| ());
         futures::join!(
-            Self::run_all_workers(self.futures, self.workers, shutdown),
+            Self::run_all_workers(self.futures, shutdown),
             shutdown_future,
         );
 
@@ -165,24 +168,26 @@ impl Monitor {
     }
 
     /// Runs every worker to completion, then starts the shutdown.
-    async fn run_all_workers(
-        futures: Vec<BoxFuture<'static, ()>>,
-        workers: Vec<Worker<Context>>,
-        shutdown: Shutdown,
-    ) {
-        // Setting the shutdown flag does not wake idle workers, and above 30 futures
-        // `join_all` only re-polls the ones whose waker fired, so wake them all explicitly.
-        let wake_on_shutdown = shutdown.clone().then(move |()| {
-            for worker in &workers {
-                worker.state.wake();
-            }
-            pending::<()>()
-        });
-        match select(join_all(futures), wake_on_shutdown.boxed()).await {
-            Either::Left(_) => {}
-            Either::Right(((), _)) => unreachable!("pending never resolves"),
-        }
+    ///
+    /// `FuturesUnordered` only polls a worker whose waker fired, so a shutdown started
+    /// while workers are parked must wake them explicitly; see [`Self::shutdown_workers`].
+    async fn run_all_workers(futures: Vec<BoxFuture<'static, ()>>, shutdown: Shutdown) {
+        let _results: Vec<()> = futures
+            .into_iter()
+            .collect::<FuturesUnordered<_>>()
+            .collect()
+            .await;
         shutdown.start_shutdown();
+    }
+
+    /// Starts the shutdown and wakes every worker so it observes it.
+    ///
+    /// Setting the flag alone does not re-poll a worker parked on an idle backend.
+    fn shutdown_workers(shutdown: &Shutdown, workers: &[Worker<Context>]) {
+        shutdown.start_shutdown();
+        for worker in workers {
+            worker.state.wake();
+        }
     }
 
     /// Handles events emitted
@@ -281,22 +286,22 @@ mod tests {
             .build(service);
         let monitor: Monitor = Monitor::new();
         let monitor = monitor.register(worker);
-        let shutdown = monitor.shutdown.clone();
-        tokio::spawn(async move {
+        let signal = async {
             sleep(Duration::from_millis(1500)).await;
-            shutdown.start_shutdown();
-        });
-        monitor.run().await.unwrap();
+            Ok(())
+        };
+        monitor.run_with_signal(signal).await.unwrap();
     }
-    /// Regression: a monitor with more than 30 idle workers must still shut down.
+    /// Regression: shutting down a monitor of idle workers must wake every one of them.
     ///
-    /// `futures::future::join_all` polls every future it holds on each wake-up only while
-    /// there are 30 or fewer of them; above that it switches to `FuturesOrdered`, which
-    /// polls just the futures whose own waker was woken. Starting a shutdown only flips a
-    /// shared flag, so unless every worker is woken explicitly the idle ones are never
-    /// re-polled and never observe it.
+    /// The monitor polls a worker only when its waker fires, and signalling shutdown just
+    /// flips a shared flag, so unless every worker is woken explicitly the idle ones are
+    /// never re-polled and never observe it. Historically this only showed above 30
+    /// workers, because `join_all` re-polled every future while it held 30 or fewer;
+    /// `FuturesUnordered` has no such fast path, so the count here is just the old
+    /// threshold kept for reference.
     #[tokio::test]
-    async fn shutdown_wakes_idle_workers_above_join_all_threshold() {
+    async fn shutdown_wakes_idle_workers() {
         const WORKERS: usize = 31;
 
         let mut monitor: Monitor = Monitor::new();
@@ -312,13 +317,13 @@ mod tests {
             monitor = monitor.register(worker);
         }
 
-        let shutdown = monitor.shutdown.clone();
-        tokio::spawn(async move {
+        let signal = async {
             sleep(Duration::from_millis(100)).await;
-            shutdown.start_shutdown();
-        });
+            Ok(())
+        };
 
-        let result = tokio::time::timeout(Duration::from_secs(5), monitor.run()).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), monitor.run_with_signal(signal)).await;
 
         let exit = match result {
             Ok(exit) => exit,
@@ -415,13 +420,12 @@ mod tests {
         });
         let monitor = monitor.register(worker);
         assert_eq!(monitor.futures.len(), 1);
-        let shutdown = monitor.shutdown.clone();
-        tokio::spawn(async move {
+        let signal = async {
             sleep(Duration::from_millis(1000)).await;
-            shutdown.start_shutdown();
-        });
+            Ok(())
+        };
 
-        let result = monitor.run().await;
+        let result = monitor.run_with_signal(signal).await;
         sleep(Duration::from_millis(1000)).await;
         assert!(result.is_ok());
     }
